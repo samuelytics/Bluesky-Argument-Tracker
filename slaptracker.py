@@ -104,9 +104,7 @@ outdict = dict()
 messagecount = 0
 output_interval = 1
 finished = False
-important_items = ['follow', 'post', 'repost', 'block'] 
-blocked_rows=None
-blocked_post_rows=None
+important_items = ['follow', 'post', 'repost', 'block']
 
 db = duckdb.connect(':memory:')
 db.execute("""
@@ -271,53 +269,19 @@ async def assemble_post_rows():
                 ]
             )
 
-async def broadcast_the_blockedest():
-    global blocked_rows
+async def broadcast_blocked_data():
     while not finished:
         count = db.execute("SELECT COUNT(*) FROM blocked").fetchone()[0]
         if count > 0:
-            
-            blocked_rows = db.execute("""
-                SELECT subject, COUNT(rev) AS rev, MIN(time)
-                FROM blocked
-                GROUP BY subject
-                ORDER BY rev DESC
-                LIMIT 5
-            """).fetchall()
-            payload = json.dumps({
-                'type': 'blocked_accounts',
-                'subject': [r[0] for r in blocked_rows],
-                'rev': [r[1] for r in blocked_rows],
-            })
-            dead = set()
-            for ws in connected_clients:
-                try:
-                    await ws.send_text(payload)
-                except Exception:
-                    dead.add(ws)
-            connected_clients.difference_update(dead)
-        await asyncio.sleep(output_interval)
-
-async def broadcast_blockedest_bad_posts():
-    global blocked_post_rows
-    while not finished:
-        #print('broadcasting bad  posts')
-        if blocked_rows:
-            db.execute("DROP TABLE IF EXISTS blockedest")
-            db.execute("""
-                CREATE TABLE blockedest (
-                    subject VARCHAR,
-                    rev BIGINT,
-                    min_time TIMESTAMP
-                )
-            """)
-            db.executemany(
-                "INSERT INTO blockedest VALUES (?, ?, ?)",
-                blocked_rows
-            )
-
-            blocked_post_rows = db.execute("""
-                WITH candidates AS (
+            rows = db.execute("""
+                WITH top_blocked AS (
+                    SELECT subject, COUNT(rev) AS rev, MIN(time) AS min_time
+                    FROM blocked
+                    GROUP BY subject
+                    ORDER BY rev DESC
+                    LIMIT 5
+                ),
+                candidates AS (
                     SELECT
                         b.subject,
                         b.rev,
@@ -341,23 +305,32 @@ async def broadcast_blockedest_bad_posts():
                                      ELSE epoch(p.time)
                                 END
                         ) AS rn
-                    FROM blockedest b
+                    FROM top_blocked b
                     LEFT JOIN posts p ON p.did = b.subject
                 )
                 SELECT * EXCLUDE (rn)
                 FROM candidates
                 WHERE rn = 1
+                ORDER BY rev DESC
             """).fetchall()
-            payload = json.dumps({
-                'type': 'blocked_posts',
-                'subject': [r[0] for r in blocked_post_rows],
-                'post_rkey': [r[4] for r in blocked_post_rows],
-                'post_time': [r[7] for r in blocked_post_rows]
+
+            accounts_payload = json.dumps({
+                'type': 'blocked_accounts',
+                'subject': [r[0] for r in rows],
+                'rev': [r[1] for r in rows],
             })
+            posts_payload = json.dumps({
+                'type': 'blocked_posts',
+                'subject': [r[0] for r in rows],
+                'post_rkey': [r[4] for r in rows],
+                'post_time': [str(r[7]) if r[7] is not None else None for r in rows]
+            })
+
             dead = set()
             for ws in connected_clients:
                 try:
-                    await ws.send_text(payload)
+                    await ws.send_text(accounts_payload)
+                    await ws.send_text(posts_payload)
                 except Exception:
                     dead.add(ws)
             connected_clients.difference_update(dead)
@@ -368,9 +341,9 @@ async def broadcast_blockedest_bad_posts():
 async def lifespan(app: Starlette):
     app.state.client_task = asyncio.create_task(start_the_client())
     app.state.pop_task = asyncio.create_task(pop_em_over())
-    app.state.assemble_task = asyncio.create_task(assemble_blocked_rows())
-    app.state.broadcast_task = asyncio.create_task(broadcast_the_blockedest())
-    app.state.broadcast_blocked_posts = asyncio.create_task(broadcast_blockedest_bad_posts())
+    app.state.assemble_blocked_task = asyncio.create_task(assemble_blocked_rows())
+    app.state.assemble_post_task = asyncio.create_task(assemble_post_rows())
+    app.state.broadcast_task = asyncio.create_task(broadcast_blocked_data())
     yield
     # Shutdown
     global finished
@@ -380,7 +353,8 @@ async def lifespan(app: Starlette):
     for task in (
         app.state.client_task,
         app.state.pop_task,
-        app.state.assemble_task,
+        app.state.assemble_blocked_task,
+        app.state.assemble_post_task,
         app.state.broadcast_task,
     ):
         task.cancel()
