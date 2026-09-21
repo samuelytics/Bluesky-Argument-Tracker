@@ -1,0 +1,7 @@
+atproto
+starlette
+uvicorn
+duckdb
+sortedcontainers
+aiohttp
+pandas
