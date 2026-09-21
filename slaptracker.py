@@ -34,61 +34,36 @@ index_str = """<!DOCTYPE HTML>
         websocket.onmessage = ({ data }) => {
             let process_data = JSON.parse(data)
 
-            console.log(process_data.type)
-            if(process_data.type === "blocked_accounts"){
-                const docdiv = document.getElementById("blocked_accounts");
+            if(process_data.type === "blocked_table"){
+                const docdiv = document.getElementById("blocked_table");
                 docdiv.innerHTML = "";
-    
-                let keys = Object.keys(process_data)
-                console.log(keys)
-                for (let i = 0; i < process_data.subject.length; i++){
-                    console.log(process_data.subject[i] + ", " + process_data.rev[i])
-                }
-                console.log(process_data)
+
                 let data_table = `
                     <table border=1>
-                        <tr> 
+                        <tr>
                             <th> Blocked Person </th>
                             <th> Number of Blocks </th>
+                            <th> Post </th>
+                            <th> Time of Post </th>
                         </tr>
                 `
                 for (let j = 0; j < process_data.subject.length; j++){
-                    data_table += "<tr> <td>" + process_data.subject[j] + "</td>" + "<td>" + process_data.rev[j] + "</td> </tr>"
-                }
-                data_table += "</table>"
-                docdiv.innerHTML = data_table
-            } else if(process_data.type ==="blocked_posts"){
-                console.log('okay')
-                const docdiv = document.getElementById("blocked_posts");
-                docdiv.innerHTML = "";
-                let keys = Object.keys(process_data)
-                for (let i = 0; i < process_data.subject.length; i++){
-                    console.log(process_data.subject[i] + ", " + process_data.post_rkey[i])
-                }
-                let data_table = `
-                    <table border=1>
-                        <tr> 
-                            <th> Blocked Person </th>
-                            <th> Blocked Post </th>
-                            <th> Time of Blocked Post </th>
-                        </tr>
-                `
-                for (let j = 0; j < process_data.subject.length; j++){
-                    data_table += "<tr> <td>" + process_data.subject[j] + "</td>" + "<td>" + process_data.post_rkey[j] + "</td> <td>" + process_data.post_time + "</td> </tr>"
+                    const did_link = "<a href='" + process_data.profile_url[j] + "'>" + process_data.subject[j] + "</a>"
+                    const post_cell = process_data.post_url[j]
+                        ? "<a href='" + process_data.post_url[j] + "'>" + process_data.post_rkey[j] + "</a>"
+                        : ""
+                    const post_time = process_data.post_time[j] || ""
+                    data_table += "<tr> <td>" + did_link + "</td>" + "<td>" + process_data.rev[j] + "</td>" + "<td>" + post_cell + "</td> <td>" + post_time + "</td> </tr>"
                 }
                 data_table += "</table>"
                 docdiv.innerHTML = data_table
             }
-
-
-
         };
     });
     </script>
 </head>
 <body>
-    <div id="blocked_accounts"></div>
-    <div id="blocked_posts"></div> 
+    <div id="blocked_table"></div>
 </body>
 </html>
 """ % (SERVER_PORT)
@@ -221,9 +196,8 @@ async def assemble_blocked_rows():
                 ]
             )
 
-async def assemble_post_rows(): 
-    while True: 
-        print('assembling post rows')
+async def assemble_post_rows():
+    while True:
         q = outdict.get('post')
         if q is None: 
             if finished: 
@@ -314,23 +288,26 @@ async def broadcast_blocked_data():
                 ORDER BY rev DESC
             """).fetchall()
 
-            accounts_payload = json.dumps({
-                'type': 'blocked_accounts',
+            payload = json.dumps({
+                'type': 'blocked_table',
                 'subject': [r[0] for r in rows],
                 'rev': [r[1] for r in rows],
-            })
-            posts_payload = json.dumps({
-                'type': 'blocked_posts',
-                'subject': [r[0] for r in rows],
+                'profile_url': [f"https://bsky.app/profile/{r[0]}" for r in rows],
                 'post_rkey': [r[4] for r in rows],
-                'post_time': [str(r[7]) if r[7] is not None else None for r in rows]
+                'post_url': [
+                    f"https://bsky.app/profile/{r[0]}/post/{r[4]}" if r[4] is not None else None
+                    for r in rows
+                ],
+                'post_time': [
+                    r[7].strftime('%m-%d %H:%M') if r[7] is not None else None
+                    for r in rows
+                ],
             })
 
             dead = set()
             for ws in connected_clients:
                 try:
-                    await ws.send_text(accounts_payload)
-                    await ws.send_text(posts_payload)
+                    await ws.send_text(payload)
                 except Exception:
                     dead.add(ws)
             connected_clients.difference_update(dead)
