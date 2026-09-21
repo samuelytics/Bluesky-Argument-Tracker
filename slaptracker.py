@@ -4,7 +4,7 @@ from convenient_pickle import *
 from atproto import FirehoseSubscribeReposClient, firehose_models, parse_subscribe_repos_message
 from atproto import CAR, models
 from atproto_client.models.network.bsky.jetstream.subscribe_events import Commit
-from atproto import AsyncJetstreamClient, jetstream_models, models, IdResolver
+from atproto import AsyncJetstreamClient, jetstream_models, models, IdResolver, AsyncClient
 import time
 import asyncio
 import contextlib
@@ -12,7 +12,7 @@ import queue
 import base64
 from sortedcontainers import SortedList
 import duckdb
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import aiohttp
 import json
 
@@ -74,12 +74,16 @@ def homepage(request):
 #Needed to use the jetstream us-west on account of te default base_uri not working for some reason.
 client = AsyncJetstreamClient(base_uri="wss://jetstream.us-west.bsky.network/xrpc", params={'kinds': ['commit']})
 
+# Unauthenticated public AppView client, used to look up a blocked account's
+# own posts (and their reply/quote counts) at broadcast time.
+bsky_public_client = AsyncClient(base_url="https://public.api.bsky.app")
+
 msg = asyncio.Queue()
 outdict = dict()
 messagecount = 0
-output_interval = 1
+output_interval = 60
 finished = False
-important_items = ['follow', 'post', 'repost', 'block']
+important_items = ['follow', 'repost', 'block']
 
 db = duckdb.connect(':memory:')
 db.execute("""
@@ -92,26 +96,6 @@ db.execute("""
         rkey VARCHAR,
         seq BIGINT,
         subject VARCHAR,
-        time TIMESTAMP,
-        year INTEGER,
-        month INTEGER,
-        day INTEGER,
-        hour INTEGER,
-        minute INTEGER
-    )
-""")
-
-db.execute("""
-    CREATE TABLE posts (
-        collection VARCHAR,
-        did VARCHAR,
-        operation VARCHAR,
-        rev VARCHAR,
-        rkey VARCHAR,
-        seq BIGINT,
-        text VARCHAR,
-        replydid VARCHAR,
-        replypost VARCHAR,
         time TIMESTAMP,
         year INTEGER,
         month INTEGER,
@@ -196,111 +180,71 @@ async def assemble_blocked_rows():
                 ]
             )
 
-async def assemble_post_rows():
-    while True:
-        q = outdict.get('post')
-        if q is None: 
-            if finished: 
-                break
-            await asyncio.sleep(.05)
-            continue
-        try:
-            posting = await asyncio.wait_for(q.get(), timeout=0.5)
-        except asyncio.TimeoutError:
-            if finished and q.empty():
-                break
-            continue
+async def find_triggering_post(did):
+    """Look up did's own posts from the last 24h and return the (rkey, created_at)
+    of whichever has the highest reply_count + 2 * quote_count, or None."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    try:
+        response = await bsky_public_client.get_author_feed(
+            actor=did, filter='posts_no_replies', limit=100
+        )
+    except Exception:
+        return None
 
-        if posting.record is not None:
-            try: 
-                replydid = posting.record.reply.parent.uri.split('/')[2]
-                replypost = posting.record.reply.parent.uri.split('/')[4]
-            except:
-                replydid = None
-                replypost = None
-            date = datetime.fromisoformat(posting.time)
-            db.execute(
-                """
-                INSERT INTO posts
-                (collection, did, operation, rev, rkey, seq, replydid, replypost, time, year, month, day, hour, minute)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    posting.collection,
-                    posting.did,
-                    posting.operation,
-                    posting.rev,
-                    posting.rkey,
-                    posting.seq,
-                    replydid,
-                    replypost,
-                    date,
-                    date.year,
-                    date.month,
-                    date.day,
-                    date.hour,
-                    date.minute,
-                ]
-            )
+    best_rkey = None
+    best_time = None
+    best_score = -1
+    for item in response.feed:
+        post = item.post
+        try:
+            created_at = datetime.fromisoformat(post.record.created_at.replace('Z', '+00:00'))
+        except (AttributeError, ValueError):
+            continue
+        if created_at < cutoff:
+            continue
+        score = (post.reply_count or 0) + 2 * (post.quote_count or 0)
+        if score > best_score:
+            best_score = score
+            best_rkey = post.uri.split('/')[-1]
+            best_time = created_at
+
+    if best_rkey is None:
+        return None
+    return best_rkey, best_time
 
 async def broadcast_blocked_data():
     while not finished:
         count = db.execute("SELECT COUNT(*) FROM blocked").fetchone()[0]
         if count > 0:
-            rows = db.execute("""
-                WITH top_blocked AS (
-                    SELECT subject, COUNT(rev) AS rev, MIN(time) AS min_time
-                    FROM blocked
-                    GROUP BY subject
-                    ORDER BY rev DESC
-                    LIMIT 5
-                ),
-                candidates AS (
-                    SELECT
-                        b.subject,
-                        b.rev,
-                        b.min_time,
-                        p.did      AS post_did,
-                        p.rkey     AS post_rkey,
-                        p.replydid,
-                        p.replypost,
-                        p.time     AS post_time,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY b.subject
-                            ORDER BY
-                                -- priority 0: posts before this subject's
-                                -- own min block time, latest first.
-                                -- priority 1 (only reached if no post
-                                -- qualifies for priority 0): all remaining
-                                -- posts, earliest first.
-                                CASE WHEN p.time < b.min_time THEN 0 ELSE 1 END,
-                                CASE WHEN p.time < b.min_time
-                                     THEN -epoch(p.time)
-                                     ELSE epoch(p.time)
-                                END
-                        ) AS rn
-                    FROM top_blocked b
-                    LEFT JOIN posts p ON p.did = b.subject
-                )
-                SELECT * EXCLUDE (rn)
-                FROM candidates
-                WHERE rn = 1
+            top_blocked = db.execute("""
+                SELECT subject, COUNT(rev) AS rev
+                FROM blocked
+                GROUP BY subject
                 ORDER BY rev DESC
+                LIMIT 5
             """).fetchall()
+
+            subjects = [r[0] for r in top_blocked]
+            revs = [r[1] for r in top_blocked]
+            triggering_posts = await asyncio.gather(
+                *(find_triggering_post(did) for did in subjects)
+            )
+            post_rkeys = [tp[0] if tp else None for tp in triggering_posts]
+            post_times = [tp[1] if tp else None for tp in triggering_posts]
 
             payload = json.dumps({
                 'type': 'blocked_table',
-                'subject': [r[0] for r in rows],
-                'rev': [r[1] for r in rows],
-                'profile_url': [f"https://bsky.app/profile/{r[0]}" for r in rows],
-                'post_rkey': [r[4] for r in rows],
+                'subject': subjects,
+                'rev': revs,
+                'profile_url': [f"https://bsky.app/profile/{s}" for s in subjects],
+                'post_rkey': post_rkeys,
                 'post_url': [
-                    f"https://bsky.app/profile/{r[0]}/post/{r[4]}" if r[4] is not None else None
-                    for r in rows
+                    f"https://bsky.app/profile/{s}/post/{rkey}" if rkey is not None else None
+                    for s, rkey in zip(subjects, post_rkeys)
                 ],
                 'post_time': [
-                    r[7].strftime('%m-%d %H:%M') if r[7] is not None else None
-                    for r in rows
+                    t.strftime('%m-%d %H:%M') if t is not None else None
+                    for t in post_times
                 ],
             })
 
@@ -319,7 +263,6 @@ async def lifespan(app: Starlette):
     app.state.client_task = asyncio.create_task(start_the_client())
     app.state.pop_task = asyncio.create_task(pop_em_over())
     app.state.assemble_blocked_task = asyncio.create_task(assemble_blocked_rows())
-    app.state.assemble_post_task = asyncio.create_task(assemble_post_rows())
     app.state.broadcast_task = asyncio.create_task(broadcast_blocked_data())
     yield
     # Shutdown
@@ -331,7 +274,6 @@ async def lifespan(app: Starlette):
         app.state.client_task,
         app.state.pop_task,
         app.state.assemble_blocked_task,
-        app.state.assemble_post_task,
         app.state.broadcast_task,
     ):
         task.cancel()
