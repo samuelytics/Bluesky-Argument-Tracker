@@ -45,6 +45,7 @@ index_str = """<!DOCTYPE HTML>
                             <th> Display Name </th>
                             <th> Number of Blocks </th>
                             <th> Follows (24h) </th>
+                            <th> Lists </th>
                             <th> Post </th>
                             <th> Time of Post </th>
                         </tr>
@@ -52,11 +53,13 @@ index_str = """<!DOCTYPE HTML>
                 for (let j = 0; j < process_data.subject.length; j++){
                     const handle_link = "<a href='" + process_data.profile_url[j] + "'>" + process_data.handle[j] + "</a>"
                     const display_name = process_data.display_name[j] || ""
+                    const list_count = process_data.list_count[j]
+                    const list_cell = "<a href='" + process_data.clearsky_url[j] + "'>" + (list_count === null ? "?" : list_count) + "</a>"
                     const post_cell = process_data.post_url[j]
                         ? "<a href='" + process_data.post_url[j] + "'>" + process_data.post_rkey[j] + "</a>"
                         : ""
                     const post_time = process_data.post_time[j] || ""
-                    data_table += "<tr> <td>" + handle_link + "</td>" + "<td>" + display_name + "</td>" + "<td>" + process_data.rev[j] + "</td>" + "<td>" + process_data.recent_follows[j] + "</td>" + "<td>" + post_cell + "</td> <td>" + post_time + "</td> </tr>"
+                    data_table += "<tr> <td>" + handle_link + "</td>" + "<td>" + display_name + "</td>" + "<td>" + process_data.rev[j] + "</td>" + "<td>" + process_data.recent_follows[j] + "</td>" + "<td>" + list_cell + "</td>" + "<td>" + post_cell + "</td> <td>" + post_time + "</td> </tr>"
                 }
                 data_table += "</table>"
                 docdiv.innerHTML = data_table
@@ -275,13 +278,32 @@ async def count_recent_follows(did, hours=24):
         pass
     return count
 
+CLEARSKY_API_BASE = "https://public.api.clearsky.services"
+
+async def count_lists_on(did):
+    """Get the number of moderation lists did is on, via Clearsky's API. This is
+    the only source for that data (it isn't exposed by the AT Protocol itself),
+    but Clearsky has been unreliable lately, so this makes a single best-effort
+    request with a short timeout and no retries rather than hammering it."""
+    url = f"{CLEARSKY_API_BASE}/api/v1/anon/get-list/total/{did}"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        return data.get('data', {}).get('count')
+    except Exception:
+        return None
+
 async def fetch_account_data(did):
     """Gather everything the table needs about a blocked account: handle,
-    display name, recent follow count, and the post that likely set off the
-    blocks -- all looked up concurrently."""
-    profile_result, follow_count, triggering_post = await asyncio.gather(
+    display name, recent follow count, moderation-list count, and the post
+    that likely set off the blocks -- all looked up concurrently."""
+    profile_result, follow_count, list_count, triggering_post = await asyncio.gather(
         bsky_public_client.get_profile(actor=did),
         count_recent_follows(did),
+        count_lists_on(did),
         find_triggering_post(did),
         return_exceptions=True,
     )
@@ -294,6 +316,9 @@ async def fetch_account_data(did):
     if isinstance(follow_count, Exception):
         follow_count = 0
 
+    if isinstance(list_count, Exception):
+        list_count = None
+
     if isinstance(triggering_post, Exception):
         triggering_post = None
 
@@ -301,6 +326,7 @@ async def fetch_account_data(did):
         'handle': handle,
         'display_name': display_name,
         'recent_follows': follow_count,
+        'list_count': list_count,
         'triggering_post': triggering_post,
     }
 
@@ -325,6 +351,7 @@ async def broadcast_blocked_data():
             handles = [a['handle'] or s for s, a in zip(subjects, account_data)]
             display_names = [a['display_name'] for a in account_data]
             recent_follows = [a['recent_follows'] for a in account_data]
+            list_counts = [a['list_count'] for a in account_data]
             post_rkeys = [
                 a['triggering_post'][0] if a['triggering_post'] else None
                 for a in account_data
@@ -341,6 +368,8 @@ async def broadcast_blocked_data():
                 'display_name': display_names,
                 'rev': revs,
                 'recent_follows': recent_follows,
+                'list_count': list_counts,
+                'clearsky_url': [f"https://clearsky.app/{h}/lists" for h in handles],
                 'profile_url': [f"https://bsky.app/profile/{h}" for h in handles],
                 'post_rkey': post_rkeys,
                 'post_url': [
