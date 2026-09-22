@@ -120,6 +120,10 @@ db.execute("""
 # Consumer.on_connect / Consumer.on_disconnect.
 connected_clients: set = set()
 
+# Most recently broadcast payload, sent immediately to newly connected
+# clients so they don't have to wait for the next broadcast cycle.
+latest_payload = None
+
 
 async def on_message_handler(event):
     try:
@@ -331,6 +335,7 @@ async def fetch_account_data(did):
     }
 
 async def broadcast_blocked_data():
+    global latest_payload
     while not finished:
         count = db.execute("SELECT COUNT(*) FROM blocked").fetchone()[0]
         if count > 0:
@@ -382,6 +387,7 @@ async def broadcast_blocked_data():
                 ],
             })
 
+            latest_payload = payload
             dead = set()
             for ws in connected_clients:
                 try:
@@ -419,6 +425,11 @@ class Consumer(WebSocketEndpoint):
     async def on_connect(self, ws):
         await ws.accept()
         connected_clients.add(ws)
+        if latest_payload is not None:
+            try:
+                await ws.send_text(latest_payload)
+            except Exception:
+                connected_clients.discard(ws)
 
     async def on_disconnect(self, ws, close_code):
         connected_clients.discard(ws)
